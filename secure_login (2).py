@@ -1,203 +1,194 @@
-"""
-Secure login process for the Online Secure Student Information System.
-
-Security features:
-- Server-side input validation
-- Parameterized SQL query to prevent SQL injection
-- Salted password hashing using Werkzeug
-- Generic authentication errors to prevent account enumeration
-- Simple login rate limiting
-- CSRF token validation
-- Secure session configuration
-
-Run locally:
-    pip install Flask Werkzeug
-    python secure_login.py
-"""
-
-from __future__ import annotations
-
 import os
-import re
-import secrets
 import sqlite3
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
+import secrets
+import io
+from flask import Flask, render_template_string, request, session, redirect, url_for, abort, Response
+from werkzeug.security import generate_password_hash, check_password_hash
 
-from flask import Flask, abort, redirect, render_template_string, request, session, url_for
-from werkzeug.security import check_password_hash, generate_password_hash
+# --- Configuration ---
+DB_PATH = "secure_sis_demo.sqlite3"
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "secure_sis_demo.sqlite3"
-EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$")
-MAX_EMAIL_LENGTH = 254
-MIN_PASSWORD_LENGTH = 8
-MAX_PASSWORD_LENGTH = 128
-MAX_FAILED_ATTEMPTS = 5
-LOCKOUT_SECONDS = 15 * 60
+# --- UI Styles & Templates ---
+BASE_STYLE = """
+<style>
+    :root { 
+        --primary: #1a365d; --secondary: #2c5282; --text: #2d3748; 
+        --error: #e53e3e; --success: #38a169; --admin-gold: #d69e2e;
+    }
+    body { font-family: 'Segoe UI', sans-serif; background: #f7fafc; margin: 0; color: var(--text); }
+    .navbar { background: var(--primary); color: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+    .container { max-width: 900px; margin: 40px auto; background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; }
+    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e2e8f0; }
+    th { background: #edf2f7; color: var(--secondary); font-size: 0.8rem; text-transform: uppercase; }
+    .btn { padding: 8px 16px; border-radius: 6px; cursor: pointer; border: none; font-weight: bold; text-decoration: none; display: inline-block; font-size: 0.9rem; }
+    .btn-save { background: var(--success); color: white; }
+    .btn-delete { background: var(--error); color: white; }
+    .admin-tools { border: 2px dashed var(--admin-gold); padding: 1.5rem; margin-top: 2rem; border-radius: 8px; background: #fffaf0; }
+    .footer { text-align: center; margin-top: 50px; padding: 20px; font-size: 0.8rem; color: #718096; border-top: 1px solid #e2e8f0; }
+</style>
+"""
 
+LOGIN_HTML = BASE_STYLE + """
+<div class="container" style="max-width:400px; margin-top:100px; border-top: 6px solid var(--primary);">
+    <h2 style="text-align:center;">Secure SIS Login</h2>
+    {% if error %}<div style="color:var(--error); margin-bottom:15px;">{{ error }}</div>{% endif %}
+    <form method="POST">
+        <label>Email</label><br>
+        <input name="email" type="email" style="width:100%; padding:10px; margin:8px 0 20px 0; border:1px solid #ccc; border-radius:4px;" required><br>
+        <label>Password</label><br>
+        <input name="password" type="password" style="width:100%; padding:10px; margin:8px 0 20px 0; border:1px solid #ccc; border-radius:4px;" required><br>
+        <button type="submit" class="btn" style="width:100%; background:var(--primary); color:white;">Sign In</button>
+    </form>
+</div>
+"""
 
-@dataclass
-class LoginAttempt:
-    count: int
-    locked_until: float
+DASHBOARD_HTML = BASE_STYLE + """
+<div class="navbar">
+    <strong>Secure SIS Portal</strong>
+    <a href="/logout" style="color:white; text-decoration:none; font-weight:bold;">Logout</a>
+</div>
 
-FAILED_ATTEMPTS: dict[str, LoginAttempt] = {}
+<div class="container">
+    <h2>Welcome Back, {{ role|capitalize }} ({{ email }})</h2>
 
+    {% if role == 'student' %}
+        <h3>My Grades</h3>
+        <table>
+            <tr><th>Subject</th><th>Grade</th></tr>
+            {% for g in data %}
+            <tr><td>{{ g.subject }}</td><td><strong>{{ g.grade }}%</strong></td></tr>
+            {% endfor %}
+        </table>
+    {% else %}
+        <h3>Grade Management</h3>
+        <table>
+            <tr><th>Student</th><th>Subject</th><th>Grade</th><th>Actions</th></tr>
+            {% for g in data %}
+            <tr>
+                <form method="POST" action="/update">
+                    <input type="hidden" name="id" value="{{ g.id }}">
+                    <td>{{ g.student_email }}</td>
+                    <td>{{ g.subject }}</td>
+                    <td><input type="number" name="grade" value="{{ g.grade }}" style="width:50px;">%</td>
+                    <td>
+                        <button type="submit" class="btn btn-save">Update</button>
+                        {% if role == 'admin' %}
+                        <a href="/delete/{{ g.id }}" class="btn btn-delete" style="font-size:0.7rem;">Delete</a>
+                        {% endif %}
+                    </td>
+                </form>
+            </tr>
+            {% endfor %}
+        </table>
+    {% endif %}
 
-def create_app() -> Flask:
-    app = Flask(__name__)
-    app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+    {% if role == 'admin' %}
+    <div class="admin-tools">
+        <h4 style="color:var(--admin-gold); margin:0 0 10px 0;">Admin Privilege Zone</h4>
+        <p style="font-size:0.85rem;">Authorized Personnel Only: Generate a text-based audit trail of all student records.</p>
+        <a href="/admin/download_logs" class="btn" style="background:var(--admin-gold); color:white;">Download System Audit Log</a>
+    </div>
+    {% endif %}
+</div>
 
-    app.config.update(
-        SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE="Lax",
-        SESSION_COOKIE_SECURE=os.environ.get("FLASK_ENV") == "production",
-        PERMANENT_SESSION_LIFETIME=1800,
-    )
+<div class="footer">
+    Developed by <strong>Muneer Elmoussa & Tariq Hussein</strong> | SQL Database Protected
+</div>
+"""
 
-    @app.get("/")
-    def index():
-        if "user_id" in session:
-            return f"Logged in as user #{session['user_id']} with role {session['role']}"
-        return redirect(url_for("login"))
-
-    @app.route("/login", methods=["GET", "POST"])
-    def login():
-        if request.method == "GET":
-            token = secrets.token_urlsafe(32)
-            session["csrf_token"] = token
-            return render_template_string(LOGIN_TEMPLATE, csrf_token=token, error=None)
-
-        csrf_token = request.form.get("csrf_token", "")
-        if not csrf_token or not secrets.compare_digest(csrf_token, session.get("csrf_token", "")):
-            abort(403)
-
-        email = normalize_email(request.form.get("email", ""))
-        password = request.form.get("password", "")
-        client_key = rate_limit_key(request.remote_addr or "unknown", email)
-
-        if is_locked(client_key):
-            return render_template_string(
-                LOGIN_TEMPLATE,
-                csrf_token=session["csrf_token"],
-                error="Too many failed attempts. Please try again later.",
-            ), 429
-
-        if not is_valid_email(email) or not is_valid_password_shape(password):
-            record_failed_attempt(client_key)
-            return login_failed_response()
-
-        user = find_user_by_email(email)
-        if user is None or not check_password_hash(user["password_hash"], password):
-            record_failed_attempt(client_key)
-            return login_failed_response()
-
-        reset_failed_attempts(client_key)
-        session.clear() 
-        session.permanent = True
-        session["user_id"] = user["id"]
-        session["email"] = user["email"]
-        session["role"] = user["role"]
-        return redirect(url_for("index"))
-
-    return app
-
-
-def normalize_email(value: str) -> str:
-    return value.strip().lower()
-
-
-def is_valid_email(email: str) -> bool:
-    return 1 <= len(email) <= MAX_EMAIL_LENGTH and EMAIL_PATTERN.fullmatch(email) is not None
-
-
-def is_valid_password_shape(password: str) -> bool:
-    return MIN_PASSWORD_LENGTH <= len(password) <= MAX_PASSWORD_LENGTH
-
-
-def rate_limit_key(ip_address: str, email: str) -> str:
-    return f"{ip_address}:{email or 'unknown'}"
-
-
-def is_locked(key: str) -> bool:
-    attempt = FAILED_ATTEMPTS.get(key)
-    return bool(attempt and attempt.locked_until > time.time())
-
-
-def record_failed_attempt(key: str) -> None:
-    attempt = FAILED_ATTEMPTS.get(key, LoginAttempt(count=0, locked_until=0))
-    attempt.count += 1
-    if attempt.count >= MAX_FAILED_ATTEMPTS:
-        attempt.locked_until = time.time() + LOCKOUT_SECONDS
-    FAILED_ATTEMPTS[key] = attempt
-
-
-def reset_failed_attempts(key: str) -> None:
-    FAILED_ATTEMPTS.pop(key, None)
-
-
-def login_failed_response():
-    return render_template_string(
-        LOGIN_TEMPLATE,
-        csrf_token=session.get("csrf_token", ""),
-        error="Invalid email or password.",
-    ), 401
-
-
-def get_connection() -> sqlite3.Connection:
+# --- Backend Logic ---
+def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+def init_db():
+    with get_db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, password_hash TEXT, role TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS grades (id INTEGER PRIMARY KEY AUTOINCREMENT, student_id INTEGER, subject TEXT, grade INTEGER)")
+        
+        if not conn.execute("SELECT 1 FROM users").fetchone():
+            users = [
+                ("student@example.com", generate_password_hash("Student123!"), "student"),
+                ("instructor@example.com", generate_password_hash("Instructor123!"), "instructor"),
+                ("admin@example.com", generate_password_hash("Admin123!"), "admin")
+            ]
+            conn.executemany("INSERT INTO users (email, password_hash, role) VALUES (?,?,?)", users)
+            conn.execute("INSERT INTO grades (student_id, subject, grade) VALUES (1, 'Network Security', 85)")
+            conn.execute("INSERT INTO grades (student_id, subject, grade) VALUES (1, 'SQL Management', 92)")
+            conn.commit()
 
-def find_user_by_email(email: str) -> Optional[sqlite3.Row]:
-    with get_connection() as conn:
-        return conn.execute(
-            "SELECT id, email, password_hash, role FROM users WHERE email = ? AND active = 1",
-            (email,),
-        ).fetchone()
+app = Flask(__name__)
+app.secret_key = "super_secure_key"
 
+@app.route("/", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form.get("email").lower().strip()
+        password = request.form.get("password")
+        
+        with get_db() as conn:
+            user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+            if user and check_password_hash(user["password_hash"], password):
+                session.update({"uid": user["id"], "role": user["role"], "email": user["email"]})
+                return redirect(url_for("dashboard"))
+            
+        return render_template_string(LOGIN_HTML, error="Invalid email or password")
+    return render_template_string(LOGIN_HTML, error=None)
 
-def initialize_demo_database() -> None:
-    with get_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('student', 'instructor', 'admin')),
-                active INTEGER NOT NULL DEFAULT 1
-            )
-            """
-        )
-        demo_email = "student@example.com"
-        exists = conn.execute("SELECT 1 FROM users WHERE email = ?", (demo_email,)).fetchone()
-        if not exists:
-            conn.execute(
-                "INSERT INTO users (email, password_hash, role) VALUES (?, ?, ?)",
-                (demo_email, generate_password_hash("Student123!"), "student"),
-            )
+@app.route("/dashboard")
+def dashboard():
+    if "uid" not in session: return redirect(url_for("login"))
+    with get_db() as conn:
+        if session["role"] == "student":
+            data = conn.execute("SELECT * FROM grades WHERE student_id = ?", (session["uid"],)).fetchall()
+        else:
+            data = conn.execute("SELECT g.*, u.email as student_email FROM grades g JOIN users u ON g.student_id = u.id").fetchall()
+    return render_template_string(DASHBOARD_HTML, role=session["role"], email=session["email"], data=data)
 
+@app.route("/update", methods=["POST"])
+def update_grade():
+    if session.get("role") not in ["instructor", "admin"]: abort(403)
+    with get_db() as conn:
+        conn.execute("UPDATE grades SET grade = ? WHERE id = ?", (request.form.get("grade"), request.form.get("id")))
+        conn.commit()
+    return redirect(url_for("dashboard"))
 
-LOGIN_TEMPLATE = """
-<!doctype html>
-<title>Secure SIS Login</title>
-<h1>Secure SIS Login</h1>
-{% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-<form method="post" action="/login" autocomplete="off">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <label>Email <input name="email" type="email" maxlength="254" required></label><br>
-  <label>Password <input name="password" type="password" minlength="8" maxlength="128" required></label><br>
-  <button type="submit">Log in</button>
-</form>
-<p>Demo account: student@example.com / Student123!</p>
-"""
+@app.route("/delete/<int:gid>")
+def delete_grade(gid):
+    if session.get("role") != "admin": abort(403)
+    with get_db() as conn:
+        conn.execute("DELETE FROM grades WHERE id = ?", (gid,))
+        conn.commit()
+    return redirect(url_for("dashboard"))
 
+@app.route("/admin/download_logs")
+def download_logs():
+    if session.get("role") != "admin": abort(403)
+    
+    # Generate a simple text log from the database
+    output = io.StringIO()
+    output.write(f"SECURE SIS SYSTEM AUDIT LOG\n")
+    output.write(f"Authorized Admin: {session['email']}\n")
+    output.write("-" * 30 + "\n\n")
+    
+    with get_db() as conn:
+        data = conn.execute("SELECT u.email, g.subject, g.grade FROM grades g JOIN users u ON g.student_id = u.id").fetchall()
+        for row in data:
+            output.write(f"STUDENT: {row['email']} | SUBJECT: {row['subject']} | GRADE: {row['grade']}%\n")
+    
+    return Response(
+        output.getvalue(),
+        mimetype="text/plain",
+        headers={"Content-disposition": "attachment; filename=sis_audit_log.txt"}
+    )
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 if __name__ == "__main__":
-    initialize_demo_database()
-    create_app().run(debug=False)
+    init_db()
+    app.run(debug=False, port=5001)
